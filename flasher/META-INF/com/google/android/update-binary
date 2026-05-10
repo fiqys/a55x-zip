@@ -1,0 +1,281 @@
+#!/system/bin/sh
+
+OUTFD="$2"
+ZIPFILE="$3"
+SCREEN="/proc/self/fd/$OUTFD"
+TMP_DIR="/tmp/aosp_installer"
+SUPER_DEV="/dev/block/by-name/super"
+
+ui_print() {
+  while [ "$#" -gt 0 ]; do
+    printf "ui_print %s\nui_print\n" "$1" >> "$SCREEN"
+    shift
+  done
+}
+
+abort_install() {
+  ui_print "E: $*"
+  ui_print "E: Do not boot system after a failed flash."
+  ui_print "E: Log saved at $TMP_DIR/install.log"
+  exit 1
+}
+
+find_bin() {
+  name="$1"
+  found="$(command -v "$name" 2>/dev/null)"
+  if [ -n "$found" ]; then
+    printf "%s\n" "$found"
+    return
+  fi
+  for path in "/system/bin/$name" "/sbin/$name"; do
+    if [ -x "$path" ]; then
+      printf "%s\n" "$path"
+      return
+    fi
+  done
+}
+
+# Check Tools
+
+GETPROP="$(find_bin getprop)"
+UNZIP="$(find_bin unzip)"
+DD="$(find_bin dd)"
+
+[ -n "$GETPROP" ] || abort_install "getprop not found"
+[ -n "$UNZIP"   ] || abort_install "unzip not found"
+[ -n "$DD"      ] || abort_install "dd not found"
+[ -r "$ZIPFILE" ] || abort_install "Cannot read installer zip: $ZIPFILE"
+[ -e "$SUPER_DEV" ] || abort_install "super partition not found"
+
+# Setup temp dir
+
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR" || abort_install "Cannot create temp directory"
+
+# Setup awk
+
+"$UNZIP" -p "$ZIPFILE" tools/awk > "$TMP_DIR/awk" 2>/dev/null
+if [ -s "$TMP_DIR/awk" ]; then
+  chmod 755 "$TMP_DIR/awk"
+  AWK="$TMP_DIR/awk"
+else
+  AWK="$(find_bin awk)"
+fi
+
+[ -n "$AWK" ] || abort_install "awk not found (not in zip and not in recovery)"
+
+# Setup lpdump
+
+"$UNZIP" -p "$ZIPFILE" tools/lpdump > "$TMP_DIR/lpdump" 2>/dev/null
+if [ -s "$TMP_DIR/lpdump" ]; then
+  chmod 755 "$TMP_DIR/lpdump"
+  LPDUMP="$TMP_DIR/lpdump"
+else
+  LPDUMP="$(find_bin lpdump)"
+fi
+
+[ -n "$LPDUMP" ] || abort_install "lpdump not found (not in zip and not in recovery)"
+
+# Check device
+
+BOOTLOADER="$("$GETPROP" ro.bootloader)"
+[ -z "$BOOTLOADER" ] && BOOTLOADER="$("$GETPROP" ro.boot.bootloader)"
+MODEL="$("$GETPROP" ro.boot.em.model)"
+SLOT_SUFFIX="$("$GETPROP" ro.boot.slot_suffix)"
+
+case "$BOOTLOADER" in
+  A556EXXSABYI4)
+    EXPECTED_MODEL="SM-A556E"
+    ;;
+  A556BXXSABYI1)
+    EXPECTED_MODEL="SM-A556B"
+    ;;
+  *)
+    abort_install "Unsupported firmware base: $BOOTLOADER (expected A556EXXSABYI4 or A556BXXSABYI1)"
+    ;;
+esac
+
+case "$SLOT_SUFFIX" in
+  _a|_b) ;;
+  *) abort_install "Unsupported active slot: $SLOT_SUFFIX" ;;
+esac
+
+if [ -n "$MODEL" ] && [ "$MODEL" != "$EXPECTED_MODEL" ]; then
+  abort_install "Model mismatch: expected $EXPECTED_MODEL, got $MODEL"
+fi
+
+# Check partitions
+
+for part in boot vendor_boot vbmeta dtbo; do
+  [ -e "/dev/block/by-name/${part}${SLOT_SUFFIX}" ] || \
+    abort_install "Block device not found: /dev/block/by-name/${part}${SLOT_SUFFIX}"
+done
+
+# Banner
+
+ui_print "  ============================================"
+ui_print "        AOSP Installer  --  Galaxy A55x"
+ui_print "  ============================================"
+ui_print ""
+ui_print "    Model    : ${MODEL:-unknown}"
+ui_print "    Firmware : $BOOTLOADER"
+ui_print "    Slot     : $SLOT_SUFFIX"
+ui_print ""
+ui_print "  ============================================"
+
+# Super flashing logic
+
+get_partition_extents() {
+  logical_name="$1"
+  "$LPDUMP" "$SUPER_DEV" 2>/dev/null | "$AWK" -v part="$logical_name" '
+    $1 == "Name:" {
+      inpart = ($2 == part)
+      next
+    }
+    inpart && $2 == ".." && $4 == "linear" && $5 == "super" {
+      sectors = $3 - $1 + 1
+      printf "%.0f %.0f\n", sectors * 512, $6 * 512
+      seen = 1
+    }
+    inpart && $1 == "------------------------" && seen {
+      exit
+    }
+  '
+}
+
+make_write_plan() {
+  extents_file="$1"
+  image_size="$2"
+  plan_file="$3"
+
+  "$AWK" -v image="$image_size" '
+    BEGIN {
+      remaining = image + 0
+      input_offset = 0
+      capacity = 0
+    }
+    NF >= 2 {
+      bytes = $1 + 0
+      target_offset = $2 + 0
+      capacity += bytes
+      if (remaining > 0) {
+        write_bytes = bytes
+        if (write_bytes > remaining) {
+          write_bytes = remaining
+        }
+        printf "%.0f %.0f %.0f\n", write_bytes, target_offset, input_offset
+        input_offset += write_bytes
+        remaining -= write_bytes
+      }
+    }
+    END {
+      if (capacity <= 0) { exit 2 }
+      if (image > capacity) { exit 3 }
+      if (remaining > 0) { exit 4 }
+    }
+  ' "$extents_file" > "$plan_file"
+}
+
+partition_capacity() {
+  "$AWK" '{ total += $1 } END { printf "%.0f\n", total }' "$1"
+}
+
+zip_entry_size() {
+  "$UNZIP" -l "$ZIPFILE" "$1" 2>/dev/null | "$AWK" -v file="$1" '$4 == file { print $1; exit }'
+}
+
+write_image_plan() {
+  plan_file="$1"
+  tmp_img="$2"
+
+  while read write_bytes target_offset input_offset; do
+    [ -n "$write_bytes" ] || continue
+    (
+      "$DD" if="$tmp_img" of="$SUPER_DEV" bs=1048576 \
+        skip="$input_offset" count="$write_bytes" iflag=skip_bytes,count_bytes \
+        seek="$target_offset" oflag=seek_bytes \
+        conv=notrunc,fsync status=none
+    ) >> "$TMP_DIR/install.log" 2>&1 || return 1
+  done < "$plan_file"
+
+  return 0
+}
+
+flash_image_to_super() {
+  image_path="$1"
+  partition="$2"
+  logical_name="${partition}${SLOT_SUFFIX}"
+  extents_file="$TMP_DIR/${logical_name}.extents"
+  plan_file="$TMP_DIR/${logical_name}.plan"
+  tmp_img="$TMP_DIR/${logical_name}.img"
+
+  "$UNZIP" -l "$ZIPFILE" "$image_path" >/dev/null 2>&1 || \
+    abort_install "Missing image in package: $image_path"
+
+  image_size="$(zip_entry_size "$image_path")"
+  [ -n "$image_size" ] || abort_install "Cannot read image size: $image_path"
+
+  get_partition_extents "$logical_name" > "$extents_file"
+  [ -s "$extents_file" ] || abort_install "Partition not found in super metadata: $logical_name"
+
+  make_write_plan "$extents_file" "$image_size" "$plan_file" || \
+    abort_install "$logical_name is smaller than image ($image_size bytes)"
+
+  capacity="$(partition_capacity "$extents_file")"
+  ui_print "- ${logical_name}: capacity ${capacity} bytes"
+  ui_print "- Extracting ${partition}..."
+
+  # Extract to temp file so dd can seek within it (can't skip_bytes on a pipe)
+  "$UNZIP" -p "$ZIPFILE" "$image_path" > "$tmp_img" 2>> "$TMP_DIR/install.log" || \
+    abort_install "Failed to extract $image_path"
+
+  ui_print "- Flashing ${partition}..."
+
+  write_image_plan "$plan_file" "$tmp_img" || \
+    abort_install "Failed to flash $logical_name"
+
+  rm -f "$tmp_img"
+  sync
+  ui_print "- ${partition} written (${image_size} bytes)"
+}
+
+# Flash the raw images
+
+flash_image() {
+  image_path="$1"
+  partition="$2"
+  dev="$3"
+
+  ui_print "- Flashing ${partition}..."
+  "$UNZIP" -p "$ZIPFILE" "$image_path" | \
+    "$DD" of="$dev" bs=1048576 conv=notrunc,fsync 2>> "$TMP_DIR/install.log" \
+    || abort_install "Failed to flash $partition"
+  sync
+  ui_print "- ${partition} done."
+}
+
+# Flash super contents to their place
+
+ui_print "- Flashing super contents..."
+flash_image_to_super "images/system_a.img"      "system"
+flash_image_to_super "images/product_a.img"     "product"
+flash_image_to_super "images/system_ext_a.img"  "system_ext"
+flash_image_to_super "images/system_dlkm_a.img" "system_dlkm"
+flash_image_to_super "images/vendor_a.img"      "vendor"
+flash_image_to_super "images/vendor_dlkm_a.img" "vendor_dlkm"
+flash_image_to_super "images/odm_a.img"         "odm"
+
+# Flash raw partitions
+
+flash_image "images/boot.img"        "boot"        "/dev/block/by-name/boot${SLOT_SUFFIX}"
+flash_image "images/vendor_boot.img" "vendor_boot" "/dev/block/by-name/vendor_boot${SLOT_SUFFIX}"
+flash_image "images/vbmeta.img"      "vbmeta"      "/dev/block/by-name/vbmeta${SLOT_SUFFIX}"
+flash_image "images/dtbo.img"        "dtbo"        "/dev/block/by-name/dtbo${SLOT_SUFFIX}"
+
+# Finally done
+
+sync
+ui_print "- All partitions flashed successfully."
+ui_print "- Reboot to recovery before booting if you need to flash addons."
+rm -rf "$TMP_DIR"
+exit 0
