@@ -35,42 +35,31 @@ find_bin() {
   done
 }
 
-# Check Tools
+# Check Tools (lpdump will be provided by the zip)
 
 GETPROP="$(find_bin getprop)"
 UNZIP="$(find_bin unzip)"
 DD="$(find_bin dd)"
+AWK="$(find_bin awk)"
 
 [ -n "$GETPROP" ] || abort_install "getprop not found"
 [ -n "$UNZIP"   ] || abort_install "unzip not found"
 [ -n "$DD"      ] || abort_install "dd not found"
+[ -n "$AWK"     ] || abort_install "awk not found"
 [ -r "$ZIPFILE" ] || abort_install "Cannot read installer zip: $ZIPFILE"
 [ -e "$SUPER_DEV" ] || abort_install "super partition not found"
 
-# Setup temp dir
+# Setup the lpdump
 
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR" || abort_install "Cannot create temp directory"
-
-# Setup awk
-
-"$UNZIP" -p "$ZIPFILE" tools/awk > "$TMP_DIR/awk" 2>/dev/null
-if [ -s "$TMP_DIR/awk" ]; then
-  chmod 755 "$TMP_DIR/awk"
-  AWK="$TMP_DIR/awk"
-else
-  AWK="$(find_bin awk)"
-fi
-
-[ -n "$AWK" ] || abort_install "awk not found (not in zip and not in recovery)"
-
-# Setup lpdump
 
 "$UNZIP" -p "$ZIPFILE" tools/lpdump > "$TMP_DIR/lpdump" 2>/dev/null
 if [ -s "$TMP_DIR/lpdump" ]; then
   chmod 755 "$TMP_DIR/lpdump"
   LPDUMP="$TMP_DIR/lpdump"
 else
+  # Fall back to system lpdump if bundled one failed to extract
   LPDUMP="$(find_bin lpdump)"
 fi
 
@@ -114,7 +103,7 @@ done
 # Banner
 
 ui_print "  ============================================"
-ui_print "        AOSP Installer  --  Galaxy A55x"
+ui_print "        AOSP Installer  --  Galaxy a55x"
 ui_print "  ============================================"
 ui_print ""
 ui_print "    Model    : ${MODEL:-unknown}"
@@ -253,6 +242,15 @@ flash_image() {
   sync
   ui_print "- ${partition} done."
 }
+
+# Flash super LP metadata first so lpdump reads correct extents
+
+ui_print "- Flashing super partition metadata..."
+"$UNZIP" -p "$ZIPFILE" images/super_metadata.img | \
+  "$DD" of="$SUPER_DEV" bs=1048576 conv=notrunc,fsync 2>> "$TMP_DIR/install.log" \
+  || abort_install "Failed to flash super metadata"
+sync
+ui_print "- Super metadata flashed."
 
 # Flash super contents to their place
 
