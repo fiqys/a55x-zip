@@ -35,37 +35,45 @@ find_bin() {
   done
 }
 
-# Check Tools (lpdump will be provided by the zip)
+# ── Tool discovery ────────────────────────────────────────────────────────────
 
 GETPROP="$(find_bin getprop)"
 UNZIP="$(find_bin unzip)"
 DD="$(find_bin dd)"
-AWK="$(find_bin awk)"
 
 [ -n "$GETPROP" ] || abort_install "getprop not found"
 [ -n "$UNZIP"   ] || abort_install "unzip not found"
 [ -n "$DD"      ] || abort_install "dd not found"
-[ -n "$AWK"     ] || abort_install "awk not found"
 [ -r "$ZIPFILE" ] || abort_install "Cannot read installer zip: $ZIPFILE"
 [ -e "$SUPER_DEV" ] || abort_install "super partition not found"
 
-# Setup the lpdump
+# ── Setup TMP ─────────────────────────────────────────────────────────────────
 
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR" || abort_install "Cannot create temp directory"
+
+# ── Extract bundled tools ─────────────────────────────────────────────────────
 
 "$UNZIP" -p "$ZIPFILE" tools/lpdump > "$TMP_DIR/lpdump" 2>/dev/null
 if [ -s "$TMP_DIR/lpdump" ]; then
   chmod 755 "$TMP_DIR/lpdump"
   LPDUMP="$TMP_DIR/lpdump"
 else
-  # Fall back to system lpdump if bundled one failed to extract
   LPDUMP="$(find_bin lpdump)"
 fi
 
+"$UNZIP" -p "$ZIPFILE" tools/awk > "$TMP_DIR/awk" 2>/dev/null
+if [ -s "$TMP_DIR/awk" ]; then
+  chmod 755 "$TMP_DIR/awk"
+  AWK="$TMP_DIR/awk"
+else
+  AWK="$(find_bin awk)"
+fi
+
+[ -n "$AWK"    ] || abort_install "awk not found (not in zip and not in recovery)"
 [ -n "$LPDUMP" ] || abort_install "lpdump not found (not in zip and not in recovery)"
 
-# Check device
+# ── Device & firmware checks ──────────────────────────────────────────────────
 
 BOOTLOADER="$("$GETPROP" ro.bootloader)"
 [ -z "$BOOTLOADER" ] && BOOTLOADER="$("$GETPROP" ro.boot.bootloader)"
@@ -93,14 +101,14 @@ if [ -n "$MODEL" ] && [ "$MODEL" != "$EXPECTED_MODEL" ]; then
   abort_install "Model mismatch: expected $EXPECTED_MODEL, got $MODEL"
 fi
 
-# Check partitions
+# ── Partition checks ──────────────────────────────────────────────────────────
 
 for part in boot vendor_boot vbmeta dtbo; do
   [ -e "/dev/block/by-name/${part}${SLOT_SUFFIX}" ] || \
     abort_install "Block device not found: /dev/block/by-name/${part}${SLOT_SUFFIX}"
 done
 
-# Banner
+# ── Banner ────────────────────────────────────────────────────────────────────
 
 ui_print "  ============================================"
 ui_print "        AOSP Installer  --  Galaxy a55x"
@@ -112,7 +120,7 @@ ui_print "    Slot     : $SLOT_SUFFIX"
 ui_print ""
 ui_print "  ============================================"
 
-# Super flashing logic
+# ── Super flashing helpers ────────────────────────────────────────────────────
 
 get_partition_extents() {
   logical_name="$1"
@@ -214,7 +222,6 @@ flash_image_to_super() {
   ui_print "- ${logical_name}: capacity ${capacity} bytes"
   ui_print "- Extracting ${partition}..."
 
-  # Extract to temp file so dd can seek within it (can't skip_bytes on a pipe)
   "$UNZIP" -p "$ZIPFILE" "$image_path" > "$tmp_img" 2>> "$TMP_DIR/install.log" || \
     abort_install "Failed to extract $image_path"
 
@@ -228,7 +235,34 @@ flash_image_to_super() {
   ui_print "- ${partition} written (${image_size} bytes)"
 }
 
-# Flash the raw images
+# Product uses pipe directly to avoid OOM (can be large on some builds)
+flash_product_to_super() {
+  logical_name="product${SLOT_SUFFIX}"
+  extents_file="$TMP_DIR/${logical_name}.extents"
+  image_path="images/product_a.img"
+  
+  # 1. Get the size of the image from the zip
+  image_size="$(zip_entry_size "$image_path")"
+  [ -n "$image_size" ] || abort_install "Cannot read image size: $image_path"
+
+  get_partition_extents "$logical_name" > "$extents_file"
+  [ -s "$extents_file" ] || abort_install "Partition not found in super metadata: $logical_name"
+
+  # Read offset dynamically from lpdump output
+  target_offset="$("$AWK" 'NR==1 { print $2 }' "$extents_file")"
+  [ -n "$target_offset" ] || abort_install "Cannot read product offset"
+
+  ui_print "- Flashing product with stream..."
+  "$UNZIP" -p "$ZIPFILE" images/product_a.img | \
+    "$DD" of="$SUPER_DEV" bs=1048576 \
+      seek="$target_offset" oflag=seek_bytes \
+      conv=notrunc,fsync 2>> "$TMP_DIR/install.log" \
+    || abort_install "Failed to flash product"
+  sync
+  ui_print "- Product written (${image_size} bytes)"
+}
+
+# ── Raw partition helper ──────────────────────────────────────────────────────
 
 flash_image() {
   image_path="$1"
@@ -243,7 +277,7 @@ flash_image() {
   ui_print "- ${partition} done."
 }
 
-# Flash super LP metadata first so lpdump reads correct extents
+# ── Flash super metadata ──────────────────────────────────────────────────────
 
 ui_print "- Flashing super partition metadata..."
 "$UNZIP" -p "$ZIPFILE" images/super_metadata.img | \
@@ -252,25 +286,25 @@ ui_print "- Flashing super partition metadata..."
 sync
 ui_print "- Super metadata flashed."
 
-# Flash super contents to their place
+# ── Flash super contents ──────────────────────────────────────────────────────
 
 ui_print "- Flashing super contents..."
 flash_image_to_super "images/system_a.img"      "system"
-flash_image_to_super "images/product_a.img"     "product"
+flash_product_to_super
 flash_image_to_super "images/system_ext_a.img"  "system_ext"
 flash_image_to_super "images/system_dlkm_a.img" "system_dlkm"
 flash_image_to_super "images/vendor_a.img"      "vendor"
 flash_image_to_super "images/vendor_dlkm_a.img" "vendor_dlkm"
 flash_image_to_super "images/odm_a.img"         "odm"
 
-# Flash raw partitions
+# ── Flash raw partitions ──────────────────────────────────────────────────────
 
 flash_image "images/boot.img"        "boot"        "/dev/block/by-name/boot${SLOT_SUFFIX}"
 flash_image "images/vendor_boot.img" "vendor_boot" "/dev/block/by-name/vendor_boot${SLOT_SUFFIX}"
 flash_image "images/vbmeta.img"      "vbmeta"      "/dev/block/by-name/vbmeta${SLOT_SUFFIX}"
 flash_image "images/dtbo.img"        "dtbo"        "/dev/block/by-name/dtbo${SLOT_SUFFIX}"
 
-# Finally done
+# ── Done ─────────────────────────────────────────────────────────────────────
 
 sync
 ui_print "- All partitions flashed successfully."
