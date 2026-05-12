@@ -36,7 +36,7 @@ SIZE_CHECK_EXEMPT = {
 }
 
 
-# ── Super metadata ─────────────────────────────────────────────────────────────
+# ── Sparse detection & conversion ──────────────────────────────────────────────
 
 SPARSE_MAGIC = b"\x3a\xff\x26\xed"
 
@@ -45,6 +45,104 @@ def is_sparse(img_path: Path) -> bool:
     with open(img_path, "rb") as f:
         return f.read(4) == SPARSE_MAGIC
 
+
+def unsparse_image(src_path: Path, tmp_dir: Path) -> Path:
+    """Convert a sparse image to raw and return the raw path."""
+    simg2img = shutil.which("simg2img")
+    if not simg2img:
+        print("  [!] simg2img not found — install android-tools or AOSP host tools")
+        sys.exit(1)
+    raw_path = tmp_dir / (src_path.stem + "-raw.img")
+    subprocess.run(
+        [simg2img, str(src_path), str(raw_path)],
+        check=True,
+        capture_output=True,
+    )
+    return raw_path
+
+
+def check_and_convert_images(out_dir: Path, tmp_dir: Path) -> dict[str, Path]:
+    """
+    For every image in PARTITION_MAP, check whether it is sparse.
+    While checking, a spinner animates on a single line showing X/total.
+    When a check finishes the counter ticks up; sparse images are converted
+    in-place and a note is printed above before the spinner resumes.
+
+    Returns a mapping of  dest_name → final_path  (raw if converted, original otherwise).
+    """
+    entries  = list(PARTITION_MAP.items())
+    total    = len(entries)
+    resolved: dict[str, Path] = {}
+    SPINNER  = ["|", "/", "-", "\\"]
+    spin_i   = 0
+    SPIN_HZ  = 0.07   # seconds between spinner frames while reading
+
+    def spin_frame(checked: int, current_file: str) -> None:
+        nonlocal spin_i
+        frame = SPINNER[spin_i % len(SPINNER)]
+        spin_i += 1
+        sys.stdout.write(f"\r  Checking images for sparse format  {checked}/{total}  {frame}  {current_file:<28}")
+        sys.stdout.flush()
+
+    print(f"\n  Checking images for sparse format  0/{total}")
+
+    checked = 0
+    for dest, src in entries:
+        src_path = out_dir / src
+
+        # Animate the spinner while we open and read the magic bytes
+        # (reads are near-instant on local storage but the animation
+        #  makes the progress feel tangible across all 11 images)
+        if src_path.exists():
+            import threading
+
+            done_flag = threading.Event()
+
+            def _spin(checked=checked, src=src):
+                while not done_flag.is_set():
+                    spin_frame(checked, src)
+                    time.sleep(SPIN_HZ)
+
+            spinner_thread = threading.Thread(target=_spin, daemon=True)
+            spinner_thread.start()
+
+            sparse = is_sparse(src_path)
+
+            done_flag.set()
+            spinner_thread.join()
+        else:
+            sparse = False
+
+        checked += 1
+
+        if sparse:
+            # Print conversion notice on a fresh line, then resume
+            sys.stdout.write(f"\r  {src:<28} is sparse → converting with simg2img...{' ' * 10}\n")
+            sys.stdout.flush()
+            raw_path = unsparse_image(src_path, tmp_dir)
+            resolved[dest] = raw_path
+            sys.stdout.write(f"  {src:<28} → {format_size(raw_path.stat().st_size)} raw\n")
+            sys.stdout.flush()
+        else:
+            resolved[dest] = src_path
+
+        # Tick the counter up after check is done
+        sys.stdout.write(f"\r  Checking images for sparse format  {checked}/{total}  ✓  {'done':<28}")
+        sys.stdout.flush()
+
+    sys.stdout.write(f"\r  Checking images for sparse format  {total}/{total}  ✓  complete{' ' * 20}\n")
+    sys.stdout.flush()
+
+    sparse_count = sum(1 for d, s in entries if resolved.get(d) != out_dir / s and resolved.get(d) is not None and (out_dir / s).exists())
+    if sparse_count:
+        print(f"  Converted {sparse_count} sparse image(s) to raw.")
+    else:
+        print("  All images are already raw.")
+
+    return resolved
+
+
+# ── Super metadata ─────────────────────────────────────────────────────────────
 
 def extract_super_metadata(out_dir: Path, tmp_dir: Path) -> Path:
     """Extract LP metadata from super.img and return path to the metadata file."""
@@ -65,7 +163,7 @@ def extract_super_metadata(out_dir: Path, tmp_dir: Path) -> Path:
             sys.exit(1)
         subprocess.run(
             [simg2img, str(super_img), str(raw_img)],
-            check=True
+            check=True,
         )
         print("  Conversion done.")
     else:
@@ -75,10 +173,10 @@ def extract_super_metadata(out_dir: Path, tmp_dir: Path) -> Path:
     print("  Extracting LP metadata (first 4MB)...")
     subprocess.run(
         ["dd", f"if={raw_img}", f"of={meta_path}", "bs=1048576", "count=4"],
-        check=True, capture_output=True
+        check=True, capture_output=True,
     )
 
-    # Clean up raw if we created it
+    # Clean up the temporary raw super image if we created it
     if raw_img != super_img and raw_img.exists():
         raw_img.unlink()
 
@@ -211,12 +309,18 @@ def build_zip(out_dir: Path, build_name: str, build_date: str, repo_dir: Path) -
 
     start = time.time()
 
-    # Extract super metadata before opening zip
     tmp_dir = repo_dir / ".pack_tmp"
     tmp_dir.mkdir(exist_ok=True)
+
+    # ── Phase 1: sparse check & conversion ────────────────────────────────────
+    resolved = check_and_convert_images(out_dir, tmp_dir)
+
+    # ── Phase 2: super LP metadata ────────────────────────────────────────────
     print("\n  Extracting super LP metadata...")
     meta_path = extract_super_metadata(out_dir, tmp_dir)
 
+    # ── Phase 3: pack zip ─────────────────────────────────────────────────────
+    print()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
 
         # META-INF
@@ -238,19 +342,18 @@ def build_zip(out_dir: Path, build_name: str, build_date: str, repo_dir: Path) -
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 zf.writestr(zi, path.read_bytes())
 
-        # images — with progress bar
+        # images — super metadata first, then partition images
         print()
-        # super metadata first
         write_with_progress(zf, meta_path, "images/super_metadata.img")
-        # partition images
+
         for dest, src in PARTITION_MAP.items():
-            src_path = out_dir / src
-            write_with_progress(zf, src_path, f"images/{dest}")
+            final_path = resolved.get(dest, out_dir / src)
+            write_with_progress(zf, final_path, f"images/{dest}")
 
     elapsed = time.time() - start
     zip_size = zip_path.stat().st_size
 
-    # Clean up temp dir
+    # Clean up temp dir (includes any unsparse'd raw images)
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Verify zip integrity
