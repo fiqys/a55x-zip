@@ -263,9 +263,8 @@ flash_product_to_super() {
 }
 
 #Stream system to reduce time
-
 flash_system_to_super() {
-  logical_name="product${SLOT_SUFFIX}"
+  logical_name="system${SLOT_SUFFIX}"
   extents_file="$TMP_DIR/${logical_name}.extents"
   image_path="images/system_a.img"
   
@@ -278,7 +277,7 @@ flash_system_to_super() {
 
   # Read offset dynamically from lpdump output
   target_offset="$("$AWK" 'NR==1 { print $2 }' "$extents_file")"
-  [ -n "$target_offset" ] || abort_install "Cannot read product offset"
+  [ -n "$target_offset" ] || abort_install "Cannot read system offset"
 
   ui_print "- Flashing system with stream..."
   "$UNZIP" -p "$ZIPFILE" images/system_a.img | \
@@ -288,6 +287,33 @@ flash_system_to_super() {
     || abort_install "Failed to flash system"
   sync
   ui_print "- System written (${image_size} bytes)"
+}
+
+#Stream system to reduce time
+flash_systemext_to_super() {
+  logical_name="system_ext${SLOT_SUFFIX}"
+  extents_file="$TMP_DIR/${logical_name}.extents"
+  image_path="images/system_ext_a.img"
+  
+  # 1. Get the size of the image from the zip
+  image_size="$(zip_entry_size "$image_path")"
+  [ -n "$image_size" ] || abort_install "Cannot read image size: $image_path"
+
+  get_partition_extents "$logical_name" > "$extents_file"
+  [ -s "$extents_file" ] || abort_install "Partition not found in super metadata: $logical_name"
+
+  # Read offset dynamically from lpdump output
+  target_offset="$("$AWK" 'NR==1 { print $2 }' "$extents_file")"
+  [ -n "$target_offset" ] || abort_install "Cannot read system_ext offset"
+
+  ui_print "- Flashing system_ext with stream..."
+  "$UNZIP" -p "$ZIPFILE" images/system_ext_a.img | \
+    "$DD" of="$SUPER_DEV" bs=8388608 \
+      seek="$target_offset" oflag=seek_bytes \
+      conv=notrunc 2>> "$TMP_DIR/install.log" \
+    || abort_install "Failed to flash system_ext"
+  sync
+  ui_print "- System_ext written (${image_size} bytes)"
 }
 
 # ── Raw partition helper ──────────────────────────────────────────────────────
@@ -319,7 +345,7 @@ ui_print "- Super metadata flashed."
 ui_print "- (1/2) Flashing super contents..."
 flash_system_to_super
 flash_product_to_super
-flash_image_to_super "images/system_ext_a.img"  "system_ext"
+flash_systemext_to_super
 flash_image_to_super "images/system_dlkm_a.img" "system_dlkm"
 flash_image_to_super "images/vendor_a.img"      "vendor"
 flash_image_to_super "images/vendor_dlkm_a.img" "vendor_dlkm"
